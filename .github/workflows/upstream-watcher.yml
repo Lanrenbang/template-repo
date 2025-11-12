@@ -13,7 +13,7 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
 
       - name: 'Run upstream checker'
-        uses: Lanrenbang/template-repo/.github/actions/upstream-checker@21b992115171c60e7e2dab53e1875a8bb434bf43  # v1.0.0
+        uses: Lanrenbang/template-repo/.github/actions/upstream-checker@f27a9e2586948ef308d3cc8fc0d54a8c29c4a9f8  # v1.0.0
         with:
           repositories: |
             golang/go
