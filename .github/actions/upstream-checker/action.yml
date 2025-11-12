@@ -1,0 +1,109 @@
+name: 'Upstream Dependency Checker'
+description: 'Checks for updates in upstream repositories and commits changes if updates are found.'
+
+inputs:
+  repositories:
+    description: 'Multiline string of upstream repositories in "owner/repo" format.'
+    required: true
+  state_file:
+    description: 'The path to the file storing the SHAs.'
+    required: true
+    default: 'UPSTREAM_VERSION'
+  token:
+    description: 'A PAT with repo scope to push the commit.'
+    required: true
+  include_prereleases:
+    description: 'If true, checks for the latest release/pre-release tag instead of the latest commit.'
+    required: false
+    default: 'false'
+
+runs:
+  using: "composite"
+  steps:
+    - name: 'Check for updates and commit'
+      shell: bash
+      run: |
+        set -e # Exit immediately if a command exits with a non-zero status.
+
+        STATE_FILE="${{ inputs.state_file }}"
+        UPSTREAM_REPOS="${{ inputs.repositories }}"
+        
+        # 1. Read current state file into an associative array for easy lookup
+        declare -A current_shas
+        if [[ -f "$STATE_FILE" ]]; then
+          while read -r line; do
+            repo=$(echo "$line" | cut -d' ' -f1)
+            sha=$(echo "$line" | cut -d' ' -f2)
+            current_shas["$repo"]="$sha"
+          done < "$STATE_FILE"
+        fi
+
+        # 2. Loop through upstream repos and check for new SHAs
+        has_changed=false
+        commit_body=""
+        new_state_content=""
+
+        echo "Checking upstream repositories for updates..."
+        for repo in $UPSTREAM_REPOS; do
+          echo "-> Checking $repo"
+          latest_sha="" # Initialize variable
+          
+          if [[ "${{ inputs.include_prereleases }}" == "true" ]]; then
+            echo "  - Mode: Checking latest release (including pre-releases)."
+            # The /releases endpoint returns a list sorted by creation date, descending.
+            # The first item is the most recent, regardless of whether it's a pre-release.
+            latest_sha=$(curl -s -L -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${{ inputs.token }}" \
+              "https://api.github.com/repos/$repo/releases?per_page=1" | jq -r '.[0].target_commitish')
+          else
+            echo "  - Mode: Checking latest commit on default branch."
+            # Use GitHub API to get the latest SHA for the default branch
+            latest_sha=$(curl -s -L -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer ${{ inputs.token }}" \
+              "https://api.github.com/repos/$repo/commits?per_page=1" | jq -r '.[0].sha')
+          fi
+          
+          if [[ -z "$latest_sha" || "$latest_sha" == "null" ]]; then
+            echo "Warning: Could not fetch a valid SHA for $repo in the selected mode. Skipping."
+            continue
+          fi
+
+          current_sha=${current_shas["$repo"]}
+
+          if [[ "$latest_sha" != "$current_sha" ]]; then
+            echo "  - UPDATE FOUND for $repo: $current_sha -> $latest_sha"
+            has_changed=true
+            current_shas["$repo"]="$latest_sha"
+            commit_body+="* Updates $repo to commit ${latest_sha:0:7}\n"
+          else
+            echo "  - $repo is up-to-date."
+          fi
+        done
+
+        # 3. If changes were found, write file and push commit
+        if ! $has_changed; then
+          echo "All upstream repositories are up-to-date. Nothing to do."
+          exit 0
+        fi
+
+        echo "Changes detected. Preparing to commit."
+        
+        # Re-create the state file content from the updated map
+        for repo in "${!current_shas[@]}"; do
+          new_state_content+="$repo ${current_shas[$repo]}\n"
+        done
+        echo -e "$new_state_content" > "$STATE_FILE"
+        
+        # 4. Configure git and push
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        
+        git add "$STATE_FILE"
+        # Create a commit message that our release-drafter can understand
+        git commit -m "feat(deps): sync upstream dependencies" -m "$(echo -e "$commit_body")"
+        
+        # Push using the provided PAT
+        # The 'x-access-token' is the standard way to use a token with git
+        git push "https://x-access-token:${{ inputs.token }}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }}
+
+        echo "Successfully committed and pushed updates to $STATE_FILE."
