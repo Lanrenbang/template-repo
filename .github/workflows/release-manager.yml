@@ -55,4 +55,4 @@ jobs:
           name: ${{ github.event.inputs.prerelease_suffix && format('{0}-{1}', steps.drafter.outputs.name, github.event.inputs.prerelease_suffix) || steps.drafter.outputs.name }}
           prerelease: ${{ github.event.inputs.prerelease_suffix != '' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.ACTIONS_PAT }} # must for release
