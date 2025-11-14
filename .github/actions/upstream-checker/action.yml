@@ -1,109 +1,290 @@
 name: 'Upstream Dependency Checker'
-description: 'Checks for updates in upstream repositories and commits changes if updates are found.'
+description: 'Checks for updates in upstream repositories and optionally commits changes to a state file.'
 
 inputs:
   repositories:
-    description: 'Multiline string of upstream repositories in "owner/repo" format.'
+    description: 'Multiline string of upstream repositories in "owner/repo" format (one per line).'
     required: true
   state_file:
-    description: 'The path to the file storing the SHAs.'
-    required: true
-    default: 'UPSTREAM_VERSION'
-  token:
-    description: 'A PAT with repo scope to push the commit.'
-    required: true
-  include_prereleases:
-    description: 'If true, checks for the latest release/pre-release tag instead of the latest commit.'
+    description: 'Path to file storing versions (format: "owner/repo sha tag_name"). If empty, only outputs results without committing.'
     required: false
-    default: 'false'
+    default: ''
+  token:
+    description: 'GitHub token for API access. Optional for public repos but recommended to avoid rate limits. Required for private repositories.'
+    required: false
+    default: ''
+  check_type:
+    description: 'What to check: "release" (latest stable release), "prerelease" (latest release including pre-releases), or "commit" (latest commit on default branch).'
+    required: false
+    default: 'release'
+
+outputs:
+  results:
+    description: 'JSON array of results: [{"repo": "owner/repo", "sha": "abc123...", "tag": "v1.0.0"}]'
+    value: ${{ steps.check_updates.outputs.results }}
+  has_updates:
+    description: 'Boolean string ("true"/"false") indicating if any updates were found compared to state_file.'
+    value: ${{ steps.check_updates.outputs.has_updates }}
 
 runs:
   using: "composite"
   steps:
-    - name: 'Check for updates and commit'
+    - name: 'Check for updates'
+      id: check_updates
       shell: bash
       run: |
-        set -e # Exit immediately if a command exits with a non-zero status.
-
+        set -e
+        
         STATE_FILE="${{ inputs.state_file }}"
         UPSTREAM_REPOS="${{ inputs.repositories }}"
+        CHECK_TYPE="${{ inputs.check_type }}"
+        TOKEN="${{ inputs.token }}"
         
-        # 1. Read current state file into an associative array for easy lookup
+        # Validate check_type
+        if [[ ! "$CHECK_TYPE" =~ ^(release|prerelease|commit)$ ]]; then
+          echo "❌ Error: check_type must be 'release', 'prerelease', or 'commit'"
+          exit 1
+        fi
+        
+        # Helper function for curl with optional auth
+        curl_api() {
+          local url="$1"
+          if [[ -n "$TOKEN" ]]; then
+            curl -s -L \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer $TOKEN" \
+              "$url"
+          else
+            curl -s -L \
+              -H "Accept: application/vnd.github.v3+json" \
+              "$url"
+          fi
+        }
+        
+        # Read current state from file
         declare -A current_shas
-        if [[ -f "$STATE_FILE" ]]; then
-          while read -r line; do
-            repo=$(echo "$line" | cut -d' ' -f1)
-            sha=$(echo "$line" | cut -d' ' -f2)
+        declare -A current_tags
+        if [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]]; then
+          echo "📖 Reading existing state from $STATE_FILE"
+          while IFS=' ' read -r repo sha tag || [[ -n "$repo" ]]; do
+            # Skip empty lines and comments
+            [[ -z "$repo" || "$repo" =~ ^# ]] && continue
             current_shas["$repo"]="$sha"
+            current_tags["$repo"]="${tag:--}"
           done < "$STATE_FILE"
         fi
-
-        # 2. Loop through upstream repos and check for new SHAs
+        
+        # Main checking loop
+        echo ""
+        echo "════════════════════════════════════════"
+        echo "🔍 Checking repositories (mode: $CHECK_TYPE)"
+        echo "════════════════════════════════════════"
+        
         has_changed=false
         commit_body=""
-        new_state_content=""
-
-        echo "Checking upstream repositories for updates..."
-        for repo in $UPSTREAM_REPOS; do
-          echo "-> Checking $repo"
-          latest_sha="" # Initialize variable
+        declare -A new_shas
+        declare -A new_tags
+        results_json="["
+        first_result=true
+        
+        while IFS= read -r repo; do
+          repo=$(echo "$repo" | xargs)  # Trim whitespace
+          [[ -z "$repo" || "$repo" =~ ^# ]] && continue
           
-          if [[ "${{ inputs.include_prereleases }}" == "true" ]]; then
-            echo "  - Mode: Checking latest release (including pre-releases)."
-            # The /releases endpoint returns a list sorted by creation date, descending.
-            # The first item is the most recent, regardless of whether it's a pre-release.
-            latest_sha=$(curl -s -L -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: Bearer ${{ inputs.token }}" \
-              "https://api.github.com/repos/$repo/releases?per_page=1" | jq -r '.[0].target_commitish')
-          else
-            echo "  - Mode: Checking latest commit on default branch."
-            # Use GitHub API to get the latest SHA for the default branch
-            latest_sha=$(curl -s -L -H "Accept: application/vnd.github.v3+json" \
-              -H "Authorization: Bearer ${{ inputs.token }}" \
-              "https://api.github.com/repos/$repo/commits?per_page=1" | jq -r '.[0].sha')
+          echo ""
+          echo "📦 Checking $repo"
+          
+          latest_sha=""
+          tag_name=""
+          
+          case "$CHECK_TYPE" in
+            release)
+              echo "   Mode: Latest stable release (excluding pre-releases)"
+              # Get latest stable release
+              release_data=$(curl_api "https://api.github.com/repos/$repo/releases/latest")
+              tag_name=$(echo "$release_data" | jq -r 'select(.tag_name != null) | .tag_name')
+              
+              if [[ -z "$tag_name" ]]; then
+                echo "   ⚠️  No stable release found, skipping"
+                continue
+              fi
+              ;;
+              
+            prerelease)
+              echo "   Mode: Latest release (including pre-releases)"
+              # Get latest release (including pre-releases)
+              releases_data=$(curl_api "https://api.github.com/repos/$repo/releases?per_page=1")
+              tag_name=$(echo "$releases_data" | jq -r 'select(length > 0) | .[0].tag_name')
+              
+              if [[ -z "$tag_name" ]]; then
+                echo "   ⚠️  No releases found, skipping"
+                continue
+              fi
+              ;;
+              
+            commit)
+              echo "   Mode: Latest commit on default branch"
+              # Get latest commit
+              commits_data=$(curl_api "https://api.github.com/repos/$repo/commits?per_page=1")
+              latest_sha=$(echo "$commits_data" | jq -r 'select(length > 0) | .[0].sha')
+              tag_name="-"  # No tag for raw commits
+              
+              if [[ -z "$latest_sha" ]]; then
+                echo "   ⚠️  Could not fetch latest commit, skipping"
+                continue
+              fi
+              ;;
+          esac
+          
+          # For release/prerelease modes, resolve tag to commit SHA
+          if [[ "$CHECK_TYPE" != "commit" && -n "$tag_name" ]]; then
+            # Get the ref for this tag
+            ref_data=$(curl_api "https://api.github.com/repos/$repo/git/refs/tags/$tag_name")
+            latest_sha=$(echo "$ref_data" | jq -r '.object.sha')
+            obj_type=$(echo "$ref_data" | jq -r '.object.type')
+            
+            # If it's an annotated tag, dereference to get commit SHA
+            if [[ "$obj_type" == "tag" ]]; then
+              echo "   (Dereferencing annotated tag...)"
+              tag_data=$(curl_api "https://api.github.com/repos/$repo/git/tags/$latest_sha")
+              latest_sha=$(echo "$tag_data" | jq -r '.object.sha')
+            fi
           fi
           
+          # Validate we got a SHA
           if [[ -z "$latest_sha" || "$latest_sha" == "null" ]]; then
-            echo "Warning: Could not fetch a valid SHA for $repo in the selected mode. Skipping."
+            echo "   ⚠️  Could not determine commit SHA, skipping"
             continue
           fi
-
-          current_sha=${current_shas["$repo"]}
-
-          if [[ "$latest_sha" != "$current_sha" ]]; then
-            echo "  - UPDATE FOUND for $repo: $current_sha -> $latest_sha"
+          
+          # Normalize tag (use "-" for no tag)
+          [[ -z "$tag_name" || "$tag_name" == "null" ]] && tag_name="-"
+          
+          echo "   SHA: ${latest_sha}"
+          [[ "$tag_name" != "-" ]] && echo "   Tag: ${tag_name}"
+          
+          # Store new state
+          new_shas["$repo"]="$latest_sha"
+          new_tags["$repo"]="$tag_name"
+          
+          # Check if this is an update
+          current_sha="${current_shas[$repo]}"
+          current_tag="${current_tags[$repo]:--}"
+          
+          if [[ -n "$current_sha" && "$latest_sha" != "$current_sha" ]]; then
+            echo "   ✅ UPDATE DETECTED"
             has_changed=true
-            current_shas["$repo"]="$latest_sha"
-            commit_body+="* Updates $repo to commit ${latest_sha:0:7}\n"
+            
+            # Format change message
+            if [[ "$tag_name" != "-" && "$current_tag" != "-" ]]; then
+              commit_body+="- **$repo**: \`$current_tag\` → \`$tag_name\`\n"
+            elif [[ "$tag_name" != "-" ]]; then
+              commit_body+="- **$repo**: \`${current_sha:0:7}\` → \`$tag_name\` (\`${latest_sha:0:7}\`)\n"
+            else
+              commit_body+="- **$repo**: \`${current_sha:0:7}\` → \`${latest_sha:0:7}\`\n"
+            fi
+          elif [[ -z "$current_sha" ]]; then
+            echo "   ℹ️  First time tracking this repository"
+            has_changed=true
+            if [[ "$tag_name" != "-" ]]; then
+              commit_body+="- **$repo**: Added at \`$tag_name\`\n"
+            else
+              commit_body+="- **$repo**: Added at \`${latest_sha:0:7}\`\n"
+            fi
           else
-            echo "  - $repo is up-to-date."
+            echo "   ✓ Up to date"
+          fi
+          
+          # Build JSON output
+          if ! $first_result; then
+            results_json+=","
+          fi
+          first_result=false
+          
+          # Properly escape JSON strings
+          tag_json=$(echo -n "$tag_name" | jq -R -s '.')
+          results_json+="{\"repo\":\"$repo\",\"sha\":\"$latest_sha\",\"tag\":$tag_json}"
+          
+        done <<< "$UPSTREAM_REPOS"
+        
+        results_json+="]"
+        
+        echo ""
+        echo "════════════════════════════════════════"
+        
+        # Set action outputs
+        {
+          echo "results<<EOFOUTPUT"
+          echo "$results_json"
+          echo "EOFOUTPUT"
+          echo "has_updates=$has_changed"
+        } >> $GITHUB_OUTPUT
+        
+        # Handle state file writing and committing
+        if [[ -n "$STATE_FILE" && ${#new_shas[@]} -gt 0 ]]; then
+          echo ""
+          echo "📝 Writing state to $STATE_FILE"
+          
+          # Write state file with header
+          {
+            echo "# Upstream dependency versions"
+            echo "# Format: owner/repo sha tag_name"
+            echo "# Updated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            echo "# Check type: $CHECK_TYPE"
+            echo ""
+            # Sort repos for consistent ordering
+            for repo in $(printf '%s\n' "${!new_shas[@]}" | sort); do
+              echo "$repo ${new_shas[$repo]} ${new_tags[$repo]}"
+            done
+          } > "$STATE_FILE"
+          
+          # Commit if there were actual changes
+          if [[ "$has_changed" == "true" ]]; then
+            echo ""
+            echo "📤 Committing changes..."
+            
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            
+            git add "$STATE_FILE"
+            
+            # Create commit with detailed body
+            commit_msg="feat(deps): update upstream dependencies"
+            commit_desc="### Updated Dependencies
+
+$commit_body
+---
+*Updated via [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*"
+            
+            git commit -m "$commit_msg" -m "$(echo -e "$commit_desc")"
+            
+            # Push changes
+            if [[ -n "$TOKEN" ]]; then
+              git push "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref }}
+            else
+              git push
+            fi
+            
+            echo "✅ Successfully committed and pushed updates"
+          else
+            echo "ℹ️  State file written but no changes detected (possibly first run)"
+          fi
+        elif [[ "$has_changed" == "true" ]]; then
+          echo ""
+          echo "ℹ️  Updates found but no state_file specified - skipping commit"
+        else
+          echo ""
+          echo "✅ All repositories are up to date"
+        fi
+        
+        # Display summary table
+        echo ""
+        echo "=== 📊 Results Summary ==="
+        echo "$results_json" | jq -r '.[] | "  \(.repo):"' | while read -r line; do
+          if [[ "$line" =~ ^[[:space:]]+(.+):$ ]]; then
+            repo="${BASH_REMATCH[1]}"
+            sha=$(echo "$results_json" | jq -r --arg repo "$repo" '.[] | select(.repo == $repo) | .sha')
+            tag=$(echo "$results_json" | jq -r --arg repo "$repo" '.[] | select(.repo == $repo) | .tag')
+            printf "  %-40s %s  [%s]\n" "$repo" "${sha:0:7}" "$tag"
           fi
         done
-
-        # 3. If changes were found, write file and push commit
-        if ! $has_changed; then
-          echo "All upstream repositories are up-to-date. Nothing to do."
-          exit 0
-        fi
-
-        echo "Changes detected. Preparing to commit."
-        
-        # Re-create the state file content from the updated map
-        for repo in "${!current_shas[@]}"; do
-          new_state_content+="$repo ${current_shas[$repo]}\n"
-        done
-        echo -e "$new_state_content" > "$STATE_FILE"
-        
-        # 4. Configure git and push
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        
-        git add "$STATE_FILE"
-        # Create a commit message that our release-drafter can understand
-        git commit -m "feat(deps): sync upstream dependencies" -m "$(echo -e "$commit_body")"
-        
-        # Push using the provided PAT
-        # The 'x-access-token' is the standard way to use a token with git
-        git push "https://x-access-token:${{ inputs.token }}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }}
-
-        echo "Successfully committed and pushed updates to $STATE_FILE."
