@@ -3,24 +3,20 @@ description: 'Checks for updates in upstream repositories and optionally commits
 
 inputs:
   repositories:
-    description: 'Multiline string of upstream repositories in "owner/repo" format (one per line).'
+    description: 'JSON array of repository objects: [{"repo": "owner/repo", "check_type": "release|prerelease|commit"}]. check_type is optional (defaults to auto: release → prerelease → commit).'
     required: true
   state_file:
-    description: 'Path to file storing versions (format: "owner/repo sha tag_name"). If empty, only outputs results without committing.'
+    description: 'Path to file storing versions (format: "owner/repo sha tag_name check_type"). If empty, only outputs results without committing.'
     required: false
     default: ''
   token:
     description: 'GitHub token for API access. Optional for public repos but recommended to avoid rate limits. Required for private repositories.'
     required: false
     default: ''
-  check_type:
-    description: 'What to check: "release" (latest stable release), "prerelease" (latest release including pre-releases), or "commit" (latest commit on default branch).'
-    required: false
-    default: 'release'
 
 outputs:
   results:
-    description: 'JSON array of results: [{"repo": "owner/repo", "sha": "abc123...", "tag": "v1.0.0"}]'
+    description: 'JSON array of results: [{"repo": "owner/repo", "sha": "abc123...", "tag": "v1.0.0", "check_type": "release", "is_updated": true}]'
     value: ${{ steps.check_updates.outputs.results }}
   has_updates:
     description: 'Boolean string ("true"/"false") indicating if any updates were found compared to state_file.'
@@ -36,13 +32,13 @@ runs:
         set -e
         
         STATE_FILE="${{ inputs.state_file }}"
-        UPSTREAM_REPOS="${{ inputs.repositories }}"
-        CHECK_TYPE="${{ inputs.check_type }}"
+        UPSTREAM_REPOS='${{ inputs.repositories }}'
         TOKEN="${{ inputs.token }}"
         
-        # Validate check_type
-        if [[ ! "$CHECK_TYPE" =~ ^(release|prerelease|commit)$ ]]; then
-          echo "❌ Error: check_type must be 'release', 'prerelease', or 'commit'"
+        # Validate JSON input
+        if ! echo "$UPSTREAM_REPOS" | jq empty 2>/dev/null; then
+          echo "❌ Error: repositories must be valid JSON array"
+          echo "   Example: [{"\"repo\"": "\"owner/repo\"", "\"check_type\"": "\"release\""}]"
           exit 1
         fi
         
@@ -64,80 +60,144 @@ runs:
         # Read current state from file
         declare -A current_shas
         declare -A current_tags
+        declare -A current_check_types
         if [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]]; then
           echo "📖 Reading existing state from $STATE_FILE"
-          while IFS=' ' read -r repo sha tag || [[ -n "$repo" ]]; do
+          while IFS=' ' read -r repo sha tag check_type || [[ -n "$repo" ]]; do
             # Skip empty lines and comments
             [[ -z "$repo" || "$repo" =~ ^# ]] && continue
             current_shas["$repo"]="$sha"
             current_tags["$repo"]="${tag:--}"
+            current_check_types["$repo"]="${check_type:-release}"
           done < "$STATE_FILE"
         fi
         
         # Main checking loop
         echo ""
         echo "════════════════════════════════════════"
-        echo "🔍 Checking repositories (mode: $CHECK_TYPE)"
+        echo "🔍 Checking upstream repositories"
         echo "════════════════════════════════════════"
         
         has_changed=false
         commit_body=""
         declare -A new_shas
         declare -A new_tags
+        declare -A new_check_types
         results_json="["
         first_result=true
         
-        while IFS= read -r repo; do
-          repo=$(echo "$repo" | xargs)  # Trim whitespace
-          [[ -z "$repo" || "$repo" =~ ^# ]] && continue
+        repo_count=$(echo "$UPSTREAM_REPOS" | jq '. | length')
+        
+        for ((i=0; i<repo_count; i++)); do
+          repo=$(echo "$UPSTREAM_REPOS" | jq -r ".[$i].repo")
+          requested_check_type=$(echo "$UPSTREAM_REPOS" | jq -r ".[$i].check_type // \"auto\"")
+          
+          [[ -z "$repo" || "$repo" == "null" ]] && continue
           
           echo ""
           echo "📦 Checking $repo"
           
           latest_sha=""
           tag_name=""
+          actual_check_type=""
           
-          case "$CHECK_TYPE" in
-            release)
-              echo "   Mode: Latest stable release (excluding pre-releases)"
-              # Get latest stable release
-              release_data=$(curl_api "https://api.github.com/repos/$repo/releases/latest")
-              tag_name=$(echo "$release_data" | jq -r 'select(.tag_name != null) | .tag_name')
-              
-              if [[ -z "$tag_name" ]]; then
-                echo "   ⚠️  No stable release found, skipping"
-                continue
-              fi
-              ;;
-              
-            prerelease)
-              echo "   Mode: Latest release (including pre-releases)"
-              # Get latest release (including pre-releases)
-              releases_data=$(curl_api "https://api.github.com/repos/$repo/releases?per_page=1")
-              tag_name=$(echo "$releases_data" | jq -r 'select(length > 0) | .[0].tag_name')
-              
-              if [[ -z "$tag_name" ]]; then
-                echo "   ⚠️  No releases found, skipping"
-                continue
-              fi
-              ;;
-              
-            commit)
-              echo "   Mode: Latest commit on default branch"
-              # Get latest commit
-              commits_data=$(curl_api "https://api.github.com/repos/$repo/commits?per_page=1")
-              latest_sha=$(echo "$commits_data" | jq -r 'select(length > 0) | .[0].sha')
-              tag_name="-"  # No tag for raw commits
-              
-              if [[ -z "$latest_sha" ]]; then
-                echo "   ⚠️  Could not fetch latest commit, skipping"
-                continue
-              fi
-              ;;
-          esac
+          # Function to try getting release
+          try_release() {
+            local release_data=$(curl_api "https://api.github.com/repos/$repo/releases/latest")
+            local tag=$(echo "$release_data" | jq -r 'select(.tag_name != null) | .tag_name')
+            if [[ -n "$tag" && "$tag" != "null" ]]; then
+              echo "$tag"
+              return 0
+            fi
+            return 1
+          }
+          
+          # Function to try getting prerelease
+          try_prerelease() {
+            local releases_data=$(curl_api "https://api.github.com/repos/$repo/releases?per_page=1")
+            local tag=$(echo "$releases_data" | jq -r 'select(length > 0) | .[0].tag_name')
+            if [[ -n "$tag" && "$tag" != "null" ]]; then
+              echo "$tag"
+              return 0
+            fi
+            return 1
+          }
+          
+          # Function to try getting commit
+          try_commit() {
+            local commits_data=$(curl_api "https://api.github.com/repos/$repo/commits?per_page=1")
+            local sha=$(echo "$commits_data" | jq -r 'select(length > 0) | .[0].sha')
+            if [[ -n "$sha" && "$sha" != "null" ]]; then
+              echo "$sha"
+              return 0
+            fi
+            return 1
+          }
+          
+          # Determine what to check based on requested_check_type
+          if [[ "$requested_check_type" == "auto" ]]; then
+            echo "   Mode: Auto (release → prerelease → commit)"
+            
+            # Try release first
+            if tag_name=$(try_release); then
+              actual_check_type="release"
+              echo "   ✓ Found stable release: $tag_name"
+            elif tag_name=$(try_prerelease); then
+              actual_check_type="prerelease"
+              echo "   ✓ Found prerelease: $tag_name"
+            elif latest_sha=$(try_commit); then
+              actual_check_type="commit"
+              tag_name="-"
+              echo "   ✓ Using latest commit"
+            else
+              echo "   ⚠️  Could not fetch any version, skipping"
+              continue
+            fi
+          else
+            # Validate requested check type
+            if [[ ! "$requested_check_type" =~ ^(release|prerelease|commit)$ ]]; then
+              echo "   ⚠️  Invalid check_type '$requested_check_type', skipping"
+              continue
+            fi
+            
+            actual_check_type="$requested_check_type"
+            
+            case "$requested_check_type" in
+              release)
+                echo "   Mode: Latest stable release (excluding pre-releases)"
+                if tag_name=$(try_release); then
+                  echo "   ✓ Found release: $tag_name"
+                else
+                  echo "   ⚠️  No stable release found, skipping"
+                  continue
+                fi
+                ;;
+                
+              prerelease)
+                echo "   Mode: Latest release (including pre-releases)"
+                if tag_name=$(try_prerelease); then
+                  echo "   ✓ Found release: $tag_name"
+                else
+                  echo "   ⚠️  No releases found, skipping"
+                  continue
+                fi
+                ;;
+                
+              commit)
+                echo "   Mode: Latest commit on default branch"
+                if latest_sha=$(try_commit); then
+                  tag_name="-"
+                  echo "   ✓ Found commit"
+                else
+                  echo "   ⚠️  Could not fetch latest commit, skipping"
+                  continue
+                fi
+                ;;
+            esac
+          fi
           
           # For release/prerelease modes, resolve tag to commit SHA
-          if [[ "$CHECK_TYPE" != "commit" && -n "$tag_name" ]]; then
+          if [[ "$actual_check_type" != "commit" && -n "$tag_name" ]]; then
             # Get the ref for this tag
             ref_data=$(curl_api "https://api.github.com/repos/$repo/git/refs/tags/$tag_name")
             latest_sha=$(echo "$ref_data" | jq -r '.object.sha')
@@ -162,17 +222,41 @@ runs:
           
           echo "   SHA: ${latest_sha}"
           [[ "$tag_name" != "-" ]] && echo "   Tag: ${tag_name}"
+          echo "   Check type: ${actual_check_type}"
           
           # Store new state
           new_shas["$repo"]="$latest_sha"
           new_tags["$repo"]="$tag_name"
+          new_check_types["$repo"]="$actual_check_type"
           
           # Check if this is an update
           current_sha="${current_shas[$repo]}"
           current_tag="${current_tags[$repo]:--}"
+          current_check_type="${current_check_types[$repo]:-}"
           
-          if [[ -n "$current_sha" && "$latest_sha" != "$current_sha" ]]; then
+          is_updated=false
+          
+          if [[ -z "$current_sha" ]]; then
+            echo "   ℹ️  First time tracking this repository"
+            is_updated=true
+            has_changed=true
+            if [[ "$tag_name" != "-" ]]; then
+              commit_body+="- **$repo**: Added at \`$tag_name\` (\`$actual_check_type\`)\n"
+            else
+              commit_body+="- **$repo**: Added at \`${latest_sha:0:7}\` (\`$actual_check_type\`)\n"
+            fi
+          elif [[ "$actual_check_type" != "$current_check_type" ]]; then
+            echo "   ✅ UPDATE DETECTED (check_type changed: $current_check_type → $actual_check_type)"
+            is_updated=true
+            has_changed=true
+            if [[ "$tag_name" != "-" && "$current_tag" != "-" ]]; then
+              commit_body+="- **$repo**: \`$current_tag\` (\`$current_check_type\`) → \`$tag_name\` (\`$actual_check_type\`)\n"
+            else
+              commit_body+="- **$repo**: Check type changed \`$current_check_type\` → \`$actual_check_type\`\n"
+            fi
+          elif [[ "$latest_sha" != "$current_sha" ]]; then
             echo "   ✅ UPDATE DETECTED"
+            is_updated=true
             has_changed=true
             
             # Format change message
@@ -182,14 +266,6 @@ runs:
               commit_body+="- **$repo**: \`${current_sha:0:7}\` → \`$tag_name\` (\`${latest_sha:0:7}\`)\n"
             else
               commit_body+="- **$repo**: \`${current_sha:0:7}\` → \`${latest_sha:0:7}\`\n"
-            fi
-          elif [[ -z "$current_sha" ]]; then
-            echo "   ℹ️  First time tracking this repository"
-            has_changed=true
-            if [[ "$tag_name" != "-" ]]; then
-              commit_body+="- **$repo**: Added at \`$tag_name\`\n"
-            else
-              commit_body+="- **$repo**: Added at \`${latest_sha:0:7}\`\n"
             fi
           else
             echo "   ✓ Up to date"
@@ -203,9 +279,9 @@ runs:
           
           # Properly escape JSON strings
           tag_json=$(echo -n "$tag_name" | jq -R -s '.')
-          results_json+="{\"repo\":\"$repo\",\"sha\":\"$latest_sha\",\"tag\":$tag_json}"
+          results_json+="{\"repo\":\"$repo\",\"sha\":\"$latest_sha\",\"tag\":$tag_json,\"check_type\":\"$actual_check_type\",\"is_updated\":$is_updated}"
           
-        done <<< "$UPSTREAM_REPOS"
+        done
         
         results_json+="]"
         
@@ -228,13 +304,12 @@ runs:
           # Write state file with header
           {
             echo "# Upstream dependency versions"
-            echo "# Format: owner/repo sha tag_name"
+            echo "# Format: owner/repo sha tag_name check_type"
             echo "# Updated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-            echo "# Check type: $CHECK_TYPE"
             echo ""
             # Sort repos for consistent ordering
             for repo in $(printf '%s\n' "${!new_shas[@]}" | sort); do
-              echo "$repo ${new_shas[$repo]} ${new_tags[$repo]}"
+              echo "$repo ${new_shas[$repo]} ${new_tags[$repo]} ${new_check_types[$repo]}"
             done
           } > "$STATE_FILE"
           
@@ -267,7 +342,7 @@ $commit_body
             
             echo "✅ Successfully committed and pushed updates"
           else
-            echo "ℹ️  State file written but no changes detected (possibly first run)"
+            echo "ℹ️  State file written but no changes detected"
           fi
         elif [[ "$has_changed" == "true" ]]; then
           echo ""
@@ -280,11 +355,17 @@ $commit_body
         # Display summary table
         echo ""
         echo "=== 📊 Results Summary ==="
-        echo "$results_json" | jq -r '.[] | "  \(.repo):"' | while read -r line; do
-          if [[ "$line" =~ ^[[:space:]]+(.+):$ ]]; then
-            repo="${BASH_REMATCH[1]}"
-            sha=$(echo "$results_json" | jq -r --arg repo "$repo" '.[] | select(.repo == $repo) | .sha')
-            tag=$(echo "$results_json" | jq -r --arg repo "$repo" '.[] | select(.repo == $repo) | .tag')
-            printf "  %-40s %s  [%s]\n" "$repo" "${sha:0:7}" "$tag"
-          fi
+        printf "  %-40s %-10s %-15s %-12s %s\n" "Repository" "SHA" "Tag" "Check Type" "Updated"
+        printf "  %-40s %-10s %-15s %-12s %s\n" "----------------------------------------" "----------" "---------------" "------------" "-------"
+        echo "$results_json" | jq -c '.[]' | while read -r item; do
+          repo=$(echo "$item" | jq -r '.repo')
+          sha=$(echo "$item" | jq -r '.sha')
+          tag=$(echo "$item" | jq -r '.tag')
+          check_type=$(echo "$item" | jq -r '.check_type')
+          is_updated=$(echo "$item" | jq -r '.is_updated')
+          
+          update_indicator="  "
+          [[ "$is_updated" == "true" ]] && update_indicator="✅"
+          
+          printf "  %-40s %-10s %-15s %-12s %s\n" "$repo" "${sha:0:7}" "$tag" "$check_type" "$update_indicator"
         done
